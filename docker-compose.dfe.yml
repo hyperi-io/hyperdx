@@ -1,0 +1,65 @@
+# DFE Override: Replace MongoDB with FerretDB + PostgreSQL (DocumentDB)
+#
+# Usage (production):
+#   docker compose -f docker-compose.yml -f docker-compose.dfe.yml up -d
+#
+# Usage (development):
+#   docker compose -f docker-compose.dev.yml -f docker-compose.dfe.yml up -d
+#
+# This override:
+#   1. Removes the upstream 'db' (mongo) service
+#   2. Adds 'postgres' (PG 17 + DocumentDB extension) and 'ferretdb' services
+#   3. Updates the 'app' service MONGO_URI to point at FerretDB
+#   4. FerretDB exposes the MongoDB wire protocol on port 27017
+#
+# The HyperDX application code is completely unchanged — Mongoose, connect-mongo,
+# and passport-local-mongoose all work through FerretDB's MongoDB protocol proxy.
+
+services:
+  # Disable upstream mongo service (empty profile prevents it from starting)
+  db:
+    profiles:
+      - disabled
+
+  # PostgreSQL 17 with DocumentDB extension (backing store for FerretDB)
+  postgres:
+    image: ghcr.io/ferretdb/postgres-documentdb:17-0.107.0-ferretdb-2.7.0
+    environment:
+      POSTGRES_USER: hyperdx
+      POSTGRES_PASSWORD: hyperdx
+      POSTGRES_DB: postgres
+    volumes:
+      - .volumes/pg_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    restart: on-failure
+    healthcheck:
+      test: pg_isready -U hyperdx
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # FerretDB: MongoDB wire protocol proxy → PostgreSQL
+  ferretdb:
+    image: ghcr.io/ferretdb/ferretdb:2.7.0
+    environment:
+      FERRETDB_POSTGRESQL_URL: postgres://hyperdx:hyperdx@postgres:5432/postgres
+    ports:
+      - '27017:27017'
+    networks:
+      - internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  # Override app service to use FerretDB instead of mongo
+  app:
+    environment:
+      MONGO_URI: 'mongodb://hyperdx:hyperdx@ferretdb:27017/hyperdx?authMechanism=PLAIN'
+    depends_on:
+      - ch-server
+      - ferretdb
+
+networks:
+  internal:

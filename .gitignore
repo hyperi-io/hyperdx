@@ -81,3 +81,10 @@ docker-compose.prod.yml
 
 # webstorm
 .idea
+
+# AI assistant work files - never commit (local only, public repo)
+ai/
+.claude/
+STATE.md
+TODO.md
+CLAUDE.md
