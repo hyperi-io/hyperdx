@@ -54,6 +54,25 @@ if (!config.IS_LOCAL_APP_MODE) {
   app.use(passport.session());
 }
 
+// --- DFE START ---
+// DFE OIDC + Casbin middleware. When DFE_AUTH_MODE is unset, this block
+// is skipped entirely and HyperDX behaves exactly as upstream.
+// See DFE-ARCHITECTURE.md for design details.
+{
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { isDfeEnabled } = require('./dfe/config');
+  if (isDfeEnabled) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { oidcIdentityMiddleware } = require('./dfe/middleware/oidc-identity');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { casbinAuthzMiddleware } = require('./dfe/middleware/casbin-authz');
+    app.use(oidcIdentityMiddleware);
+    app.use(casbinAuthzMiddleware);
+    logger.info('DFE: OIDC identity + Casbin authz middleware enabled');
+  }
+}
+// --- DFE END ---
+
 if (!config.IS_CI) {
   app.use(expressLogger);
 }
@@ -95,6 +114,19 @@ app.use('/connections', isUserAuthenticated, connectionsRouter);
 app.use('/sources', isUserAuthenticated, sourcesRouter);
 app.use('/saved-search', isUserAuthenticated, savedSearchRouter);
 app.use('/clickhouse-proxy', isUserAuthenticated, clickhouseProxyRouter);
+
+// --- DFE ROUTES START ---
+{
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { isDfeEnabled } = require('./dfe/config');
+  if (isDfeEnabled) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const queryExportRouter = require('./dfe/routers/query-export').default;
+    app.use('/dfe', isUserAuthenticated, queryExportRouter);
+    logger.info('DFE: query export router mounted at /dfe');
+  }
+}
+// --- DFE ROUTES END ---
 // ---------------------------------------------------------------------
 
 // TODO: Separate external API routers from internal routers
