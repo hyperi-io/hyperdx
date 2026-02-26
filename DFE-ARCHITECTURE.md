@@ -46,6 +46,21 @@ upstream merge compatibility.
 - [DFE: Alerting — Disabled in Favour of DFE Rules and Hunts](#dfe-alerting--disabled-in-favour-of-dfe-rules-and-hunts)
 - [DFE: Additive-Only Feasibility Assessment](#dfe-additive-only-feasibility-assessment)
 - [DFE: FerretDB vs Direct PostgreSQL Migration](#dfe-ferretdb-vs-direct-postgresql-migration)
+- [DFE: Query-to-Rule Pipeline](#dfe-query-to-rule-pipeline)
+  - [HyperDX Query Architecture](#hyperdx-query-architecture)
+  - [Extraction Points for DFE Rules](#extraction-points-for-dfe-rules)
+  - [Recommended Approach: API Endpoint for SQL Extraction](#recommended-approach-api-endpoint-for-sql-extraction)
+  - [Frontend: Export to DFE Rule Button](#frontend-export-to-dfe-rule-button)
+    - [Option A: Deep Link](#option-a-deep-link-simpler-recommended-for-v1)
+    - [Option B: Direct Integration](#option-b-direct-integration-more-seamless)
+    - [Approach 1: Additive Only](#approach-1-additive-only-zero-upstream-file-changes)
+    - [Approach 2: Minimal Upstream Change](#approach-2-minimal-upstream-change-1-2-files)
+  - [DFE Rule Engine Consumption](#dfe-rule-engine-consumption)
+- [DFE: Automated CI Upstream Sync](#dfe-automated-ci-upstream-sync)
+  - [Sync Strategy](#sync-strategy)
+  - [CI Pipeline Design](#ci-pipeline-design)
+  - [Merge Conflict Detection and Handling](#merge-conflict-detection-and-handling)
+  - [Version Pinning and Release Cadence](#version-pinning-and-release-cadence)
 
 ---
 
@@ -1792,3 +1807,510 @@ git merge upstream/main
 
 Total files modified in upstream HyperDX: **1** (`api-app.ts`, one conditional block).
 Total new files: **~6-8** in `packages/api/src/dfe/`.
+
+---
+
+## DFE: Query-to-Rule Pipeline
+
+A key DFE workflow: a user is exploring data in HyperDX (search page or
+dashboard chart), finds something interesting, and wants to turn that query into
+a DFE Rule that runs continuously. This section documents the query architecture
+and the integration points Kay can use to build this flow.
+
+### HyperDX Query Architecture
+
+HyperDX stores queries as **structured config objects**, not raw SQL. SQL is
+generated on-the-fly from these configs at render time.
+
+```mermaid
+graph LR
+    subgraph "Frontend (Browser)"
+        UI["Search Page / Dashboard Tile"]
+        CONFIG["ChartConfig object<br/>(select, where, groupBy,<br/>source, granularity)"]
+        RENDER["renderChartConfig()"]
+        SQL_PREVIEW["ChartSQLPreview<br/>(copy-to-clipboard)"]
+    end
+
+    subgraph "Backend (API)"
+        PROXY["ClickHouse Proxy<br/>(/api/clickhouse-proxy)"]
+    end
+
+    subgraph "ClickHouse"
+        CH[("Query execution")]
+    end
+
+    UI --> CONFIG
+    CONFIG --> RENDER
+    RENDER -->|"ChSql → parameterizedQueryToSql()"| SQL_PREVIEW
+    RENDER -->|"Raw SQL via proxy"| PROXY
+    PROXY --> CH
+```
+
+The key types in the pipeline:
+
+| Type | Location | Purpose |
+| --- | --- | --- |
+| `SavedChartConfig` | `common-utils/src/types.ts` | Stored config for a dashboard tile (source, select, where, groupBy, etc.) |
+| `ChartConfigWithOptDateRange` | `common-utils/src/types.ts` | Runtime config with optional date range appended |
+| `SavedSearch` | `api/src/models/savedSearch.ts` | Persisted query with source, select, where, whereLanguage, orderBy, filters |
+| `ChSql` | `common-utils/src/clickhouse/index.ts` | Parameterized SQL template (`{ sql, params }`) |
+| `renderChartConfig()` | `common-utils/src/core/renderChartConfig.ts` | Converts config → `ChSql` (the SQL generation engine) |
+| `parameterizedQueryToSql()` | `common-utils/src/clickhouse/index.ts` | Fills parameters into `ChSql` → executable SQL string |
+
+### Extraction Points for DFE Rules
+
+There are three natural places to extract queries for DFE rules:
+
+#### 1. Dashboard Tile Config (Structured)
+
+Each dashboard tile stores a `SavedChartConfig` in MongoDB (via FerretDB). This
+is the richest extraction point — it contains the full query definition
+including aggregation functions, group-by clauses, and filters.
+
+```typescript
+// A dashboard tile's config (from GET /api/dashboards/:id)
+{
+  source: "6789abcdef012345",      // Source ID → maps to a CH table
+  displayType: "line",
+  select: [
+    { aggFn: "count", valueExpression: "", alias: "error_count" },
+  ],
+  where: "SeverityText:error AND ServiceName:api-gateway",
+  whereLanguage: "lucene",
+  groupBy: [{ valueExpression: "ServiceName" }],
+  granularity: "5m",
+  // ... filters, having, orderBy, etc.
+}
+```
+
+**Advantage**: Structured, machine-readable, includes aggregation semantics.
+The DFE rule engine can interpret the config directly without parsing SQL.
+
+#### 2. Saved Search Config (Structured)
+
+Saved searches store a similar structure (source, select, where, orderBy,
+filters). Available via `GET /api/saved-search`.
+
+```typescript
+// A saved search (from GET /api/saved-search)
+{
+  name: "API Gateway Errors",
+  source: "6789abcdef012345",
+  select: "Timestamp, SeverityText, Body",
+  where: "SeverityText:error AND ServiceName:api-gateway",
+  whereLanguage: "lucene",
+  orderBy: "Timestamp DESC",
+  filters: [],
+}
+```
+
+**Advantage**: Simpler structure, user-named, already represents a "query worth
+saving". Natural starting point for a rule.
+
+#### 3. Rendered SQL (Raw)
+
+The SQL that ClickHouse actually executes. Can be obtained by calling
+`renderChartConfig()` + `parameterizedQueryToSql()` on any config. The frontend
+already does this for the `ChartSQLPreview` component and has a copy button.
+
+```sql
+-- Rendered SQL from a dashboard tile
+SELECT
+  toStartOfInterval(TimestampTime, INTERVAL 300 SECOND) AS ts_bucket,
+  ServiceName,
+  count() AS error_count
+FROM otel_logs
+WHERE TimestampTime >= '2025-01-01 00:00:00'
+  AND TimestampTime < '2025-01-02 00:00:00'
+  AND hasToken(SeverityText, 'error')
+  AND ServiceName = 'api-gateway'
+GROUP BY ts_bucket, ServiceName
+ORDER BY ts_bucket ASC
+```
+
+**Advantage**: Directly executable by the DFE Python rule engine against
+ClickHouse (using the same team-scoped CH credentials). No translation needed.
+
+### Recommended Approach: API Endpoint for SQL Extraction
+
+Add a new DFE endpoint that accepts a chart config or saved search ID and
+returns the rendered SQL. This is additive (new file in `dfe/`) and the
+rendering logic already exists in `@hyperdx/common-utils`.
+
+```typescript
+// packages/api/src/dfe/routers/query-export.ts (NEW file)
+
+import { renderChartConfig } from '@hyperdx/common-utils/dist/core/renderChartConfig';
+import { parameterizedQueryToSql } from '@hyperdx/common-utils/dist/clickhouse';
+import { getMetadata } from '@hyperdx/common-utils/dist/core/metadata';
+import { format } from '@hyperdx/common-utils/dist/sqlFormatter';
+
+router.post('/dfe/export-sql', async (req, res) => {
+  const { teamId } = getNonNullUserWithTeam(req);
+  const { chartConfig, savedSearchId, dateRange } = req.body;
+
+  // Option A: Render from inline chart config
+  // Option B: Load saved search by ID and build config from it
+
+  const config = chartConfig ?? buildConfigFromSavedSearch(savedSearchId);
+  const metadata = await getMetadata(clickhouseClient, source);
+  const chSql = await renderChartConfig(config, metadata, querySettings);
+  const sql = format(parameterizedQueryToSql(chSql));
+
+  return res.json({
+    sql,              // Formatted, executable SQL
+    config,           // Original structured config (for DFE to interpret)
+    source: {         // Source metadata for CH connection mapping
+      name: source.name,
+      kind: source.kind,
+      tableName: source.from.tableName,
+    },
+    connectionId: source.connection,  // CH connection for this team
+  });
+});
+```
+
+This endpoint:
+
+- Uses the exact same `renderChartConfig()` pipeline that HyperDX uses
+  internally — the SQL is identical to what the user saw
+- Returns both the structured config AND the rendered SQL — the DFE rule
+  engine can use whichever is more convenient
+- Includes source metadata so the DFE side knows which CH table and connection
+  to target
+- Is fully additive — new file in `dfe/routers/`, wired via the conditional
+  block in `api-app.ts`
+
+### Frontend: Export to DFE Rule Button
+
+The user-facing flow adds an "Export to DFE Rule" action in the HyperDX UI
+that sends the current query to the DFE rules system.
+
+```mermaid
+sequenceDiagram
+    participant User as User (Browser)
+    participant HDX as HyperDX Frontend
+    participant API as HyperDX API<br/>(DFE endpoint)
+    participant DFE as DFE Rules Engine<br/>(Python)
+
+    User->>HDX: Click "Export to DFE Rule"<br/>on dashboard tile or search
+    HDX->>API: POST /api/dfe/export-sql<br/>{ chartConfig, dateRange }
+    API->>API: renderChartConfig() →<br/>parameterizedQueryToSql()
+    API-->>HDX: { sql, config, source, connectionId }
+
+    alt Option A: Deep link to DFE
+        HDX->>User: Redirect to DFE Rule UI<br/>with query params pre-filled
+        User->>DFE: DFE Rule creation page<br/>(SQL + metadata pre-populated)
+    else Option B: Direct API call
+        HDX->>DFE: POST /api/rules/create<br/>{ sql, schedule, thresholds }
+        DFE-->>HDX: Rule created
+        HDX->>User: "Rule created" confirmation
+    end
+```
+
+Two implementation options:
+
+#### Option A: Deep Link (Simpler, Recommended for v1)
+
+The HyperDX button constructs a URL to the DFE Rule creation page with the SQL
+and metadata encoded as query parameters. The DFE UI pre-populates the rule
+form. No cross-service API calls needed.
+
+```text
+https://dfe.example.com/rules/new?
+  sql=SELECT+count()+AS+error_count+FROM+otel_logs+WHERE+...
+  &table=otel_logs
+  &connection=team-sre
+  &name=API+Gateway+Errors
+```
+
+#### Option B: Direct Integration (More Seamless)
+
+The HyperDX frontend calls the DFE rules API directly (through Envoy, sharing
+the same OIDC session) to create the rule in one click. Requires the DFE rules
+API to accept a SQL-based rule definition.
+
+#### Frontend Implementation
+
+For the "Export to DFE Rule" button, two approaches depending on how much
+frontend change is acceptable:
+
+#### Approach 1: Additive Only (Zero Upstream File Changes)
+
+Add a browser extension, bookmarklet, or DFE wrapper UI that reads the current
+HyperDX page URL (which contains the full query state in URL parameters) and
+extracts the query. The search page URL contains:
+
+```text
+/search?source=...&where=...&whereLanguage=...&select=...&orderBy=...
+```
+
+This is fully self-contained — the DFE wrapper parses the URL params and calls
+the export endpoint.
+
+#### Approach 2: Minimal Upstream Change (1-2 Files)
+
+Add an "Export to DFE Rule" menu item to the existing chart context menu
+(`DBDashboardPage.tsx`) and search results toolbar (`DBSearchPage.tsx`). These
+are small UI additions (a menu item in an existing dropdown) that call the DFE
+export endpoint.
+
+Since these are in rendering code (not structural), upstream merge conflicts
+are unlikely. The same `DFE START / DFE END` comment pattern keeps changes
+identifiable.
+
+### DFE Rule Engine Consumption
+
+The DFE Python rules engine receives the exported SQL and can use it directly:
+
+```python
+# DFE Rule definition (Python side)
+class Rule:
+    name: str
+    sql_template: str       # From HyperDX export, with date placeholders
+    schedule: str           # cron expression (e.g., "*/5 * * * *")
+    threshold: float
+    threshold_type: str     # "above" or "below"
+    ch_connection: str      # ClickHouse connection name (team-scoped)
+
+    def evaluate(self, ch_client):
+        # Replace date range placeholders with current window
+        sql = self.sql_template.replace(
+            "{START_TIME}", self.window_start()
+        ).replace(
+            "{END_TIME}", self.window_end()
+        )
+        result = ch_client.query(sql)
+        return self.check_threshold(result)
+```
+
+The exported SQL from HyperDX uses hardcoded date ranges (from the user's
+current view). The DFE rule engine needs to parameterise the timestamp filters
+to make the query recurring. Two strategies:
+
+1. **SQL rewriting** — parse the SQL and replace timestamp literals with
+   placeholders. Straightforward since HyperDX always generates timestamp
+   filters in a predictable pattern (`TimestampTime >= '...' AND
+   TimestampTime < '...'`)
+
+2. **Config-based** — use the structured `ChartConfig` instead of raw SQL.
+   The config includes `granularity` and the date range is a separate field,
+   so the DFE engine can call `renderChartConfig()` itself (if using a
+   Node.js sidecar) or build SQL from the structured fields directly
+
+The structured config approach is more robust for long-term maintenance, but
+the SQL rewriting approach is simpler to implement initially and doesn't
+require the Python side to understand HyperDX's config schema.
+
+---
+
+## DFE: Automated CI Upstream Sync
+
+The goal: every time HyperDX publishes a new release, our fork automatically
+merges the changes and validates them. Human intervention is only needed when
+something breaks — and the CI tells us exactly what broke.
+
+### Sync Strategy
+
+```mermaid
+graph TB
+    subgraph "Upstream (hyperdxio/hyperdx)"
+        UPSTREAM_MAIN["main branch<br/>(new releases)"]
+    end
+
+    subgraph "DFE Fork (our repo)"
+        DFE_MAIN["main branch<br/>(production)"]
+        SYNC_BRANCH["sync/upstream-vX.Y.Z<br/>(auto-created)"]
+        DFE_FILES["dfe/ directory<br/>(our additions)"]
+    end
+
+    subgraph "CI Pipeline"
+        DETECT["Detect new upstream<br/>release (scheduled/webhook)"]
+        MERGE["git merge upstream/main<br/>(into sync branch)"]
+        CHECK{{"Merge<br/>clean?"}}
+        BUILD["Build + test<br/>(full suite)"]
+        TEST_OK{{"Tests<br/>pass?"}}
+        AUTO_PR["Auto-merge PR<br/>to main"]
+        FAIL_PR["Create PR with<br/>conflict/failure details"]
+    end
+
+    UPSTREAM_MAIN -->|"new commits"| DETECT
+    DETECT --> MERGE
+    MERGE --> CHECK
+    CHECK -->|"Yes"| BUILD
+    CHECK -->|"No (conflict)"| FAIL_PR
+    BUILD --> TEST_OK
+    TEST_OK -->|"Yes"| AUTO_PR
+    TEST_OK -->|"No"| FAIL_PR
+    AUTO_PR --> DFE_MAIN
+    FAIL_PR -->|"Human review"| DFE_MAIN
+
+    style DFE_FILES fill:#c8e6c9
+    style AUTO_PR fill:#c8e6c9
+    style FAIL_PR fill:#ffcdd2
+```
+
+The fork tracks upstream `main` as a git remote. The CI pipeline:
+
+1. Fetches upstream on a schedule (daily or on webhook)
+2. Creates a `sync/upstream-{date}` branch from our `main`
+3. Attempts `git merge upstream/main`
+4. If clean: runs the full build + test suite
+5. If tests pass: auto-merges to our `main`
+6. If anything fails: creates a PR with details for human review
+
+### CI Pipeline Design
+
+```yaml
+# .github/workflows/upstream-sync.yml
+
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: '0 6 * * 1-5'   # Weekdays at 6am UTC
+  workflow_dispatch:          # Manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure upstream remote
+        run: |
+          git remote add upstream https://github.com/hyperdxio/hyperdx.git
+          git fetch upstream main
+
+      - name: Check for new commits
+        id: check
+        run: |
+          BEHIND=$(git rev-list HEAD..upstream/main --count)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Upstream is $BEHIND commits ahead"
+
+      - name: Create sync branch and merge
+        if: steps.check.outputs.behind > 0
+        id: merge
+        run: |
+          BRANCH="sync/upstream-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH"
+          git merge upstream/main --no-edit 2>&1 | tee merge-output.txt
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test
+        if: steps.merge.outcome == 'success'
+        run: |
+          yarn install
+          yarn build
+          cd packages/api && yarn ci:int
+          cd ../common-utils && yarn ci:unit
+          cd ../app && yarn ci:unit
+
+      - name: Auto-merge PR
+        if: success()
+        run: |
+          git push origin "${{ steps.merge.outputs.branch }}"
+          gh pr create \
+            --title "sync: merge upstream $(date +%Y-%m-%d)" \
+            --body "Automated upstream sync. All tests passed." \
+            --base main
+          gh pr merge --auto --merge
+
+      - name: Create failure PR
+        if: failure()
+        run: |
+          # Push whatever state we have (even with conflicts marked)
+          git add -A
+          git commit -m "sync: upstream merge (needs manual resolution)" \
+            --allow-empty || true
+          git push origin "${{ steps.merge.outputs.branch }}" || true
+          gh pr create \
+            --title "sync: upstream merge FAILED $(date +%Y-%m-%d)" \
+            --body "$(cat merge-output.txt 2>/dev/null || echo 'See CI logs')" \
+            --base main \
+            --label "upstream-sync-failure"
+```
+
+### Merge Conflict Detection and Handling
+
+Based on our additive-only strategy, conflicts should be extremely rare. The
+CI pipeline includes specific checks for our known risk areas:
+
+```yaml
+      - name: Post-merge DFE integrity check
+        run: |
+          # 1. Verify our DFE conditional block still exists in api-app.ts
+          grep -q "DFE START" packages/api/src/api-app.ts || \
+            echo "::warning::DFE block missing from api-app.ts"
+
+          # 2. Verify all DFE files are intact
+          test -d packages/api/src/dfe || \
+            echo "::error::dfe/ directory missing"
+
+          # 3. Check for new getTeam() calls (multi-tenancy risk)
+          NEW_GETTEAM=$(git diff HEAD~1..HEAD --name-only | \
+            xargs grep -l "getTeam()" 2>/dev/null || true)
+          if [ -n "$NEW_GETTEAM" ]; then
+            echo "::warning::New getTeam() calls found: $NEW_GETTEAM"
+          fi
+
+          # 4. Check for new route prefixes not in Casbin map
+          NEW_ROUTES=$(git diff HEAD~1..HEAD -- 'packages/api/src/routers/' | \
+            grep -E "^\+.*router\.(get|post|put|patch|delete)" || true)
+          if [ -n "$NEW_ROUTES" ]; then
+            echo "::warning::New routes added — verify Casbin mapping"
+          fi
+```
+
+Expected failure frequency based on HyperDX's commit history:
+
+| Scenario | Frequency | Resolution |
+| --- | --- | --- |
+| Clean merge, all tests pass | ~95% of syncs | Fully automated |
+| Clean merge, test regression (upstream bug) | ~3% | Report upstream, skip or pin |
+| Conflict in `api-app.ts` (middleware restructure) | ~1-2 per year | Rebase DFE block (5 min) |
+| New routes need Casbin mapping | ~2-3 per year | Update `dfe/middleware/casbin-authz.ts` |
+| New `getTeam()` calls need review | ~1-2 per year | Review for multi-tenancy safety |
+
+### Version Pinning and Release Cadence
+
+The sync pipeline tracks upstream `main` continuously, but production deploys
+are gated:
+
+```text
+Upstream main ──→ Auto-sync PR ──→ DFE main ──→ Staging ──→ Production
+                  (daily)          (auto if clean)  (manual)   (manual)
+```
+
+**Tagging convention**: DFE releases are tagged as `dfe/vX.Y.Z` where `X.Y.Z`
+matches the upstream HyperDX version at the time of the fork point. For
+example, if we fork from HyperDX v2.8.0 and add our DFE layer, the tag is
+`dfe/v2.8.0-dfe.1`. Subsequent DFE-only changes increment the DFE suffix:
+`dfe/v2.8.0-dfe.2`. When upstream v2.9.0 merges cleanly, the next tag is
+`dfe/v2.9.0-dfe.1`.
+
+**Rollback strategy**: If an upstream sync introduces regressions:
+
+1. Revert the sync merge commit on `main` (single commit revert)
+2. Pin to the previous known-good upstream version
+3. Investigate the regression on the sync branch
+4. Re-merge once resolved (or skip that upstream version entirely)
+
+**Upstream version equivalence**: The CI pipeline records which upstream commit
+SHA our `main` branch includes. This is stored as a file in the repo:
+
+```text
+# .dfe-upstream-version
+# Auto-updated by CI pipeline
+upstream_repo=hyperdxio/hyperdx
+upstream_sha=abc123def456
+upstream_date=2025-07-15
+dfe_version=dfe/v2.8.0-dfe.3
+```
+
+This makes it trivial to answer "which version of HyperDX are we running?" at
+any point — critical for debugging and for communicating with upstream when
+reporting issues.
