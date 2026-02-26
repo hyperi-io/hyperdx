@@ -1,12 +1,18 @@
-# HyperDX Architecture (v2)
+# DFE Platform — Embedded HyperDX Architecture
 
-A comprehensive architectural overview of the HyperDX v2 observability platform,
-including production deployment with FerretDB + PostgreSQL.
+Architecture documentation for HyperDX as embedded within the DFE platform.
 
-HyperDX is an open-source observability platform built on ClickHouse that helps
-engineers search, visualize, and monitor logs, metrics, traces, and session
-replays. It is schema-agnostic, OpenTelemetry-native, and designed to run on top
-of any ClickHouse cluster.
+HyperDX v2 is an open-source observability frontend built on ClickHouse. Within
+DFE, it serves as the **visualization and search layer** — engineers use it to
+search logs, view traces, build dashboards, and replay sessions. Detection,
+alerting, and response workflows are handled by the DFE platform's own rules
+engine and hunt system.
+
+DFE embeds HyperDX with an **additive-only fork strategy**: authentication is
+handled externally via OIDC through Envoy, authorization is enforced by Casbin
+(shared with the DFE Python UI), and MongoDB is replaced by FerretDB backed by
+PostgreSQL. The HyperDX application code is left untouched to preserve clean
+upstream merge compatibility.
 
 ---
 
@@ -18,7 +24,7 @@ of any ClickHouse cluster.
 - [Data Flow](#data-flow)
   - [Write Path (Telemetry Ingestion)](#write-path-telemetry-ingestion)
   - [Read Path (Query Execution)](#read-path-query-execution)
-  - [Alert Evaluation](#alert-evaluation)
+  - [Alert Evaluation (Disabled in DFE)](#alert-evaluation-disabled-in-dfe--see-dfe-rules-and-hunts)
 - [Service Topology](#service-topology)
 - [Frontend Architecture](#frontend-architecture)
 - [Backend Architecture](#backend-architecture)
@@ -37,6 +43,8 @@ of any ClickHouse cluster.
   - [Policy Storage in PostgreSQL](#policy-storage-in-postgresql)
   - [Integration with Envoy OIDC and HyperDX](#integration-with-envoy-oidc-and-hyperdx)
   - [Policy Examples](#policy-examples)
+- [DFE: Alerting — Disabled in Favour of DFE Rules and Hunts](#dfe-alerting--disabled-in-favour-of-dfe-rules-and-hunts)
+- [DFE: Additive-Only Feasibility Assessment](#dfe-additive-only-feasibility-assessment)
 - [DFE: FerretDB vs Direct PostgreSQL Migration](#dfe-ferretdb-vs-direct-postgresql-migration)
 
 ---
@@ -52,26 +60,33 @@ graph TB
         SDK4["Other OTel SDKs"]
     end
 
-    subgraph "HyperDX Platform"
-        subgraph "Ingestion"
-            OTEL["OTel Collector<br/>(otelcontribcol)"]
+    subgraph "DFE Platform"
+        DFE_UI["DFE UI<br/>(Python)"]
+        DFE_RULES["DFE Rules Engine<br/>(detection + hunts)"]
+        CASBIN["Casbin<br/>(shared RBAC)"]
+        ENVOY["Envoy<br/>(OIDC proxy)"]
+
+        subgraph "Embedded HyperDX"
+            subgraph "Ingestion"
+                OTEL["OTel Collector<br/>(otelcontribcol)"]
+            end
+
+            subgraph "Storage"
+                CH[("ClickHouse<br/>Telemetry Data")]
+                FERRET["FerretDB<br/>(MongoDB wire protocol)"]
+            end
+
+            subgraph "Application"
+                API["HyperDX API<br/>(Express.js)"]
+                APP["HyperDX UI<br/>(Next.js)"]
+            end
         end
 
-        subgraph "Storage"
-            CH[("ClickHouse<br/>Telemetry Data")]
-            FERRET["FerretDB<br/>(MongoDB wire protocol)"]
-            PG[("PostgreSQL + DocumentDB<br/>Metadata")]
-        end
-
-        subgraph "Application"
-            API["HyperDX API<br/>(Express.js)"]
-            APP["HyperDX UI<br/>(Next.js)"]
-            ALERTS["Alert Checker<br/>(Background Task)"]
-        end
+        PG[("PostgreSQL + DocumentDB<br/>Metadata + Casbin policies")]
     end
 
     BROWSER["User Browser"]
-    WEBHOOKS["Webhooks<br/>(Slack, etc.)"]
+    OIDC["OIDC Provider<br/>(Google / Entra ID)"]
 
     SDK1 & SDK2 & SDK3 & SDK4 -->|"OTLP gRPC/HTTP"| OTEL
     OTEL -->|"Writes"| CH
@@ -79,13 +94,23 @@ graph TB
     API <-->|"MongoDB protocol"| FERRET
     FERRET -->|"SQL"| PG
     API -->|"Proxy"| CH
-    ALERTS -->|"Queries"| CH
-    ALERTS -->|"MongoDB protocol"| FERRET
-    ALERTS -->|"Notifications"| WEBHOOKS
-    BROWSER <-->|"HTTP"| APP
-    BROWSER -->|"API Calls"| API
-    BROWSER -->|"/api/clickhouse-proxy"| API
+    DFE_RULES -->|"Queries"| CH
+    DFE_UI --> CASBIN
+    API --> CASBIN
+    CASBIN -->|"Policies"| PG
+    BROWSER -->|"HTTPS"| ENVOY
+    ENVOY -->|"OIDC"| OIDC
+    ENVOY -->|"Identity headers"| API
+    ENVOY -->|"Identity headers"| DFE_UI
+    BROWSER --> DFE_UI
+    BROWSER --> APP
 ```
+
+The DFE platform embeds HyperDX as its visualization and search layer. Users
+access HyperDX through Envoy, which handles OIDC authentication. Casbin
+provides shared RBAC across both the DFE Python UI and HyperDX Node.js API,
+backed by the same PostgreSQL instance. Detection and alerting are handled by
+the DFE rules engine — HyperDX's built-in alerting is disabled.
 
 ---
 
@@ -321,11 +346,17 @@ credentials.
 In **local mode** (single-user deployment), the browser queries ClickHouse
 directly, bypassing the proxy entirely.
 
-### Alert Evaluation
+### Alert Evaluation (Disabled in DFE — See DFE Rules and Hunts)
+
+> **DFE note:** The HyperDX alert checker is **not started** in DFE deployments.
+> Detection and alerting are handled by the DFE platform's rules engine and hunt
+> workflows, which query ClickHouse directly. The alert API routes are blocked
+> via Casbin RBAC. The code below documents upstream HyperDX's built-in alerting
+> for reference only.
 
 ```mermaid
 flowchart LR
-    subgraph "check-alerts (Background Task)"
+    subgraph "check-alerts (Background Task) — DISABLED IN DFE"
         LOAD["Load active alerts"]
         BUILD["Build ChartConfig<br/>from alert source"]
         QUERY["Execute query<br/>on ClickHouse"]
@@ -1177,6 +1208,193 @@ g, carol@acme.com, viewer, team-platform
 | `webhooks` | `/webhooks/*` | Webhook destination CRUD |
 | `ai` | `/ai/*` | AI assistant access |
 | `clickhouse` | `/clickhouse-proxy/*` | Direct ClickHouse query proxy |
+
+---
+
+## DFE: Alerting — Disabled in Favour of DFE Rules and Hunts
+
+HyperDX includes a built-in alerting system (the `checkAlerts` background task,
+Alert/AlertHistory models, webhook notifications). **We disable this entirely**
+and use the DFE platform's own rules engine and hunt workflows instead.
+
+### What Gets Disabled
+
+| HyperDX Component | Status | Reason |
+| --- | --- | --- |
+| `checkAlerts` background task | **Disabled** — do not start this process | DFE rules engine replaces it |
+| Alert model + AlertHistory model | **Unused** — data stays in FerretDB but is never written to | No cleanup needed |
+| `/alerts` API routes | **Blocked by Casbin** — deny `alerts` resource for all roles | Or leave accessible read-only for viewing legacy alerts |
+| `/webhooks` API routes | **Blocked by Casbin** — deny `webhooks` resource | DFE handles notifications |
+| Alert UI in frontend | **Left in place** — just inaccessible via RBAC | No frontend code changes |
+| Silence alert endpoint (`/ext/silence-alert/:token`) | **Dead** — no alerts fire, so no tokens are generated | No change needed |
+
+### How to Disable
+
+The `checkAlerts` task runs as a separate Node.js process
+(`nx run @hyperdx/api:dev-task check-alerts`). In production it's started
+alongside the main API. To disable:
+
+1. **Don't start the task process** — remove the alert checker from the
+   container entrypoint or process manager (Docker CMD, supervisor config, etc.)
+2. **Casbin policy** — deny the `alerts` and `webhooks` resources for all roles,
+   so the UI routes return 403 even if someone navigates to them:
+
+```casbin
+# No policy rules for alerts or webhooks — deny-by-default blocks them.
+# Or explicitly if needed:
+# p, deny, *, alerts, *
+# p, deny, *, webhooks, *
+```
+
+### Why Not Remove the Code?
+
+Additive-only principle. The alert models, controllers, routes, and frontend
+components are all upstream code. If we delete or modify them, every upstream
+merge that touches alerting (and upstream actively develops alerting features)
+creates conflicts. By leaving the code in place but not running the task and
+blocking API access via Casbin, we get the same result with zero fork
+divergence.
+
+### DFE Rules and Hunts Replace Alerting
+
+The DFE platform provides:
+
+- **Rules** — automated detection logic that queries ClickHouse directly from
+  the Python platform, using the same team-scoped ClickHouse connection
+  credentials. Rules are managed in the DFE UI, not in HyperDX.
+- **Hunts** — interactive investigation workflows that combine queries across
+  data sources. Hunts can reference HyperDX saved searches and dashboards via
+  deep links.
+
+HyperDX remains the **visualization and search layer** — users search logs,
+view traces, build dashboards, and replay sessions. Detection and response
+logic lives in the DFE platform.
+
+---
+
+## DFE: Additive-Only Feasibility Assessment
+
+A realistic assessment of where the additive-only principle holds, where it
+gets difficult, and what the actual upstream merge cost looks like.
+
+### Per-Work-Stream Breakdown
+
+#### FerretDB: Fully Additive
+
+Zero upstream application files modified. The only changes are to Docker Compose
+(infrastructure we own) and the `MONGO_URI` environment variable value.
+
+Prior art: [FerretDB published a guide](https://blog.ferretdb.io/full-stack-observability-hyperdx-ferretdb/)
+in July 2025 confirming HyperDX works with FerretDB as a drop-in MongoDB
+replacement, with zero compatibility issues reported.
+
+**Upstream merge cost: zero.**
+
+#### OIDC Identity Middleware: Effectively Additive
+
+All DFE logic lives in new files under `packages/api/src/dfe/`. The only
+upstream file touched is `api-app.ts` with a single conditional block appended
+to the end of the middleware stack.
+
+The OIDC middleware **wraps** existing auth — it populates `req.user` the same
+way Passport does, so the existing `isUserAuthenticated` middleware passes
+through without modification. The `middleware/auth.ts` file is never touched.
+
+**Upstream merge cost: trivial.** The conditional block in `api-app.ts` is at
+the end of the file. Upstream changes to the middleware stack above it merge
+cleanly. Only a major restructuring of `api-app.ts` (rare) would require a
+manual rebase of the block.
+
+#### Casbin RBAC: Fully Additive
+
+All new files. The enforcement middleware is injected via the same conditional
+block in `api-app.ts`. No router files are modified — the authorization check
+runs globally before any route handler.
+
+**Upstream merge cost: zero** for Casbin itself. When upstream adds new route
+prefixes, the route-to-resource mapping in `dfe/middleware/casbin-authz.ts`
+needs updating — but that's our file, not an upstream conflict.
+
+#### Multi-Tenancy: Additive With a Caveat
+
+The current `getTeam()` does `Team.findOne({})` — returns the only team. We
+do **not** modify this function. Instead:
+
+- Our OIDC middleware resolves the correct team and sets `req.user.team`
+- All route handlers already read `req.user.team` via `getNonNullUserWithTeam()`
+- For DFE-specific code, we use our own `dfe/controllers/team-provisioning.ts`
+  which queries `Team.findOne({ _id: teamId })` — a new function, not a
+  modification
+
+**The risk:** If upstream adds a new controller that calls `getTeam()` directly
+(no team ID filter), it returns data from an arbitrary team. This is mitigated
+by Casbin enforcement upstream of the route handler — you can't reach the
+handler without passing RBAC. But it's defense-in-depth, not a guarantee.
+
+**What to do on each upstream merge:** grep for new calls to `getTeam()` in
+upstream changes. If any appear in routes accessible through the DFE flow,
+assess whether they need team scoping. This is a review-on-merge checklist
+item.
+
+**Upstream merge cost: zero code conflicts, but requires review of new
+`getTeam()` calls.**
+
+#### Alerting: Fully Additive (Disabled, Not Removed)
+
+The `checkAlerts` task is not started. Casbin blocks the `/alerts` and
+`/webhooks` routes. No upstream code is modified or deleted.
+
+**Upstream merge cost: zero.** Upstream can add alert features freely — the
+code merges in, it just never runs.
+
+#### Frontend: Zero to Minimal Changes
+
+Three scenarios and how they play out with zero frontend modifications:
+
+1. **Login/register pages** — Envoy intercepts unauthenticated requests before
+   they reach HyperDX and redirects to the OIDC provider. The login page is
+   never served. No change needed.
+
+2. **401 handling** — the frontend's `ky` client redirects to `/login` on 401.
+   Envoy intercepts that `/login` request and starts the OIDC flow. Extra
+   redirect hop but functionally correct. No change needed.
+
+3. **Invite UI on TeamPage** — still shows "Invite Member" buttons. These are
+   harmless in OIDC mode (invite tokens don't work for OIDC-provisioned users).
+   Confusing but not broken. No change needed unless UI polish is desired.
+
+**If UI polish is desired** (hiding invite buttons, showing role info), that
+requires 1-2 small conditionals in upstream frontend files (`TeamPage.tsx`,
+possibly `AuthPage.tsx`). These are in rendering logic, not structural code,
+so upstream conflicts are unlikely but possible.
+
+**Upstream merge cost: zero if we accept the cosmetic quirks. Trivial if we
+add 1-2 conditionals.**
+
+### Honest Summary
+
+| Work Stream | Files modified in upstream | Truly additive? | Merge cost per release |
+| --- | --- | --- | --- |
+| FerretDB | 0 | Yes | Zero |
+| OIDC middleware | 1 (`api-app.ts`) | Effectively yes | Trivial (one delimited block) |
+| Casbin RBAC | 0 | Yes | Zero (review new routes) |
+| Multi-tenancy | 0 | Yes (with review caveat) | Zero (review `getTeam()` calls) |
+| Alerting disabled | 0 | Yes | Zero |
+| Frontend | 0-2 (optional cosmetics) | Mostly | Zero to trivial |
+
+**Realistic worst case per upstream merge:**
+
+- `api-app.ts` conditional block: rebase if upstream restructures middleware
+  stack (~1 per year frequency based on commit history)
+- New route prefixes: update Casbin mapping in our `dfe/` code (no conflict)
+- New `getTeam()` calls: review for multi-tenancy safety (no conflict)
+- Frontend conditionals (if added): re-apply if upstream redesigns the page
+  (infrequent)
+
+**Total upstream files modified: 1** (`api-app.ts`), optionally **1-2** frontend
+files for cosmetics.
+
+**Total new files: ~8-10** in `packages/api/src/dfe/` plus Casbin model conf.
 
 ---
 
