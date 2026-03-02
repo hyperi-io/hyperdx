@@ -14,8 +14,7 @@ permissions:
 jobs:
   release:
     name: Release
-    runs-on: ubuntu-24.04
-    strategy:
+    runs-on: ${{ vars.GH_RUNNER_DEFAULT || 'ubuntu-latest' }}    strategy:
       fail-fast: true
       matrix:
         release:
@@ -63,8 +62,7 @@ jobs:
 
   slack-notify-failure:
     needs: release
-    runs-on: ubuntu-24.04
-    if: failure() && always()
+    runs-on: ${{ vars.GH_RUNNER_DEFAULT || 'ubuntu-latest' }}    if: failure() && always()
     steps:
       - name: Checkout
         uses: actions/checkout@v4

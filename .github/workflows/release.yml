@@ -9,8 +9,7 @@ permissions:
 jobs:
   check_changesets:
     name: Check Changesets
-    runs-on: ubuntu-24.04
-    outputs:
+    runs-on: ${{ vars.GH_RUNNER_DEFAULT || 'ubuntu-latest' }}    outputs:
       changeset_outputs_hasChangesets:
         ${{ steps.changesets.outputs.hasChangesets }}
     steps:
@@ -45,8 +44,7 @@ jobs:
   release:
     name: Release
     needs: check_changesets
-    runs-on: ubuntu-24.04
-    concurrency:
+    runs-on: ${{ vars.GH_RUNNER_DEFAULT || 'ubuntu-latest' }}    concurrency:
       group:
         ${{ github.workflow }}-release-${{ matrix.release }}-${{ github.ref }}
       cancel-in-progress: false
@@ -121,8 +119,7 @@ jobs:
   check_release_app_pushed:
     name: Check if release-app pushed
     needs: [check_changesets, release]
-    runs-on: ubuntu-24.04
-    outputs:
+    runs-on: ${{ vars.GH_RUNNER_DEFAULT || 'ubuntu-latest' }}    outputs:
       app_was_pushed: ${{ steps.check.outputs.pushed }}
     if:
       needs.check_changesets.outputs.changeset_outputs_hasChangesets == 'false'
@@ -150,8 +147,7 @@ jobs:
   notify_helm_charts:
     name: Notify Helm-Charts Downstream
     needs: [check_changesets, release, check_release_app_pushed]
-    runs-on: ubuntu-24.04
-    if: |
+    runs-on: ${{ vars.GH_RUNNER_DEFAULT || 'ubuntu-latest' }}    if: |
       needs.check_changesets.outputs.changeset_outputs_hasChangesets == 'false' &&
       needs.check_release_app_pushed.outputs.app_was_pushed == 'true'
     steps:
@@ -180,8 +176,7 @@ jobs:
   notify_ch:
     name: Notify CH Downstream
     needs: [check_changesets, release, check_release_app_pushed]
-    runs-on: ubuntu-24.04
-    # Temporarily disabled:
+    runs-on: ${{ vars.GH_RUNNER_DEFAULT || 'ubuntu-latest' }}    # Temporarily disabled:
     if: false
     # if: |
     #   needs.check_changesets.outputs.changeset_outputs_hasChangesets == 'false' &&
@@ -221,8 +216,7 @@ jobs:
     needs: [check_changesets, release, check_release_app_pushed]
     if: needs.check_release_app_pushed.outputs.app_was_pushed == 'true'
     timeout-minutes: 5
-    runs-on: ubuntu-24.04
-    steps:
+    runs-on: ${{ vars.GH_RUNNER_DEFAULT || 'ubuntu-latest' }}    steps:
       - name: Load Environment Variables from .env
         uses: xom9ikk/dotenv@v2
       - name: Notify ClickHouse/clickhouse-clickstack Downstream
